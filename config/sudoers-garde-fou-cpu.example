@@ -1,0 +1,8 @@
+# garde-fou CPU — l utilisateur ADMIN (a remplacer par votre compte) peut :
+#  - ranger SES PROPRES processus dans batch.slice (plafond CPU) : lourd-adopter
+#    refuse tout processus qui n'appartient pas a l'appelant (SUDO_UID) ;
+#  - annuler une pause / un bridage du garde-fou (reprendre, liberer).
+# Rollback : rm /etc/sudoers.d/garde-fou-cpu
+ADMIN ALL=(root) NOPASSWD: /usr/local/sbin/lourd-adopter *
+ADMIN ALL=(root) NOPASSWD: /usr/local/sbin/garde-fou-cpu reprendre *
+ADMIN ALL=(root) NOPASSWD: /usr/local/sbin/garde-fou-cpu liberer *

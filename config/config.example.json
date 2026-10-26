@@ -1,0 +1,20 @@
+{
+  "reglages": {
+    "journal": "",
+    "jeton_hostinger": "/etc/garde-fou-cpu/hostinger-token",
+    "vm_id": "",
+    "ntfy_env": "/etc/garde-fou-cpu/ntfy.env",
+    "commande_alarme": "",
+    "utilisateur_alarme": "",
+    "commande_alerte": ""
+  },
+  "fuseau": "Europe/Paris",
+  "nuit": ["22:00", "07:30"],
+  "proteges": {
+    "utilisateurs": [],
+    "cmdline_regex": [],
+    "sous_arbre_regex": [],
+    "sous_arbre_utilisateurs": [],
+    "ports": [22]
+  }
+}

@@ -1,0 +1,93 @@
+#!/usr/bin/env python3
+"""lourd-adopter — range des processus dans batch.slice (plafond CPU), via un
+scope systemd transitoire. Appele par `lourd` (root, ou un compte autorise par sudoers)
+et par le garde-fou CPU.
+
+Securite : sous sudo, l'appelant (SUDO_UID) ne peut ranger QUE ses propres
+processus ; la seule chose que ce script sait faire est de mettre des processus
+dans une slice PLUS bridee. Aucun autre effet.
+
+  lourd-adopter [--nom NOM] [--sous-arbre] PID [PID...]
+"""
+import argparse, os, re, subprocess, sys, time
+
+LOG = '/var/log/garde-fou-cpu.log'
+
+
+def proprio(pid):
+    try:
+        with open(f'/proc/{pid}/status') as f:
+            for l in f:
+                if l.startswith('Uid:'):
+                    return int(l.split()[1])
+    except OSError:
+        return None
+
+
+def enfants():
+    m = {}
+    for d in os.listdir('/proc'):
+        if d.isdigit():
+            try:
+                with open(f'/proc/{d}/stat') as f:
+                    s = f.read()
+                pp = int(s[s.rindex(')') + 2:].split()[1])
+                m.setdefault(pp, []).append(int(d))
+            except (OSError, ValueError):
+                pass
+    return m
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument('--nom', default='job')
+    ap.add_argument('--sous-arbre', action='store_true')
+    ap.add_argument('pids', nargs='+', type=int)
+    a = ap.parse_args()
+    if os.geteuid() != 0:
+        sys.exit('lourd-adopter : doit tourner en root (sudo)')
+    appelant = int(os.environ['SUDO_UID']) if os.getuid() == 0 and os.environ.get('SUDO_UID') else os.getuid()
+    pids = []
+    for p in a.pids:
+        if p <= 1:
+            sys.exit(f'lourd-adopter : PID {p} refuse')
+        pids.append(p)
+    if a.sous_arbre:
+        m, file = enfants(), list(pids)
+        while file:
+            for c in m.get(file.pop(), []):
+                if c not in pids:
+                    pids.append(c); file.append(c)
+    garde = []
+    for p in pids:
+        u = proprio(p)
+        if u is None:
+            continue
+        if appelant != 0 and u != appelant:
+            if p in a.pids:
+                sys.exit(f'lourd-adopter : PID {p} n appartient pas a l appelant (uid {appelant})')
+            continue
+        garde.append(p)
+    if not garde:
+        sys.exit('lourd-adopter : aucun processus a ranger')
+    nom = re.sub(r'[^A-Za-z0-9_.-]', '-', a.nom)[:40] or 'job'
+    unite = f'lourd-{nom}-{time.strftime("%Y%m%d-%H%M%S")}-{garde[0]}.scope'
+    cmd = ['busctl', 'call', 'org.freedesktop.systemd1', '/org/freedesktop/systemd1',
+           'org.freedesktop.systemd1.Manager', 'StartTransientUnit', 'ssa(sv)a(sa(sv))',
+           unite, 'fail', '3', 'Slice', 's', 'batch.slice',
+           'Description', 's', f'job lourd {nom} (uid {appelant})',
+           'PIDs', 'au', str(len(garde))] + [str(p) for p in garde] + ['0']
+    r = subprocess.run(cmd, capture_output=True, text=True)
+    if r.returncode != 0:
+        sys.exit(f'lourd-adopter : echec systemd : {r.stderr.strip()}')
+    try:
+        with open(LOG, 'a') as f:
+            f.write(f'{time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())} lourd-adopter uid={appelant} '
+                    f'{unite} pids={garde}\n')
+    except OSError:
+        pass
+    print(unite)
+
+
+if __name__ == '__main__':
+    main()

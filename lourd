@@ -1,0 +1,38 @@
+#!/bin/bash
+# lourd — lance un travail lourd dans batch.slice (plafond CPU commun : 50 % d'un
+# coeur = 25 % du VPS). Garde-fou CPU : l hebergeur plafonne le VPS
+# s'il tourne trop longtemps trop fort. Tout ce qui peut attendre passe par ici.
+#
+#   lourd [--nom NOM] COMMANDE [ARGS...]   lance COMMANDE (meme dossier, meme env,
+#                                          meme terminal) dans batch.slice, nice 10
+#   lourd --adopter PID [PID...]           (root) range des processus DEJA lances
+#                                          (et leurs descendants) dans batch.slice
+#   lourd --statut                         etat de batch.slice et des jobs dedans
+#
+# Exemples :  lourd optipng -o2 *.png
+#             lourd --nom build bash -c 'make -j2 && make install'
+# Ne marche que pour root et pour les comptes autorises par sudoers (sudo restreint a /usr/local/sbin/lourd-adopter).
+set -u
+ADOPTER=/usr/local/sbin/lourd-adopter
+usage() { sed -n '2,15p' "$0" | sed 's/^# \{0,1\}//'; exit "${1:-0}"; }
+case "${1:-}" in
+  ""|-h|--help) usage 0 ;;
+  --statut)
+    echo "batch.slice : $(systemctl show batch.slice -p CPUQuotaPerSecUSec --value) de CPU par seconde (plafond)"
+    echo "cpu.stat :"; sed 's/^/  /' /sys/fs/cgroup/batch.slice/cpu.stat 2>/dev/null
+    echo "jobs :"; systemctl list-units --no-legend --type=scope 'lourd-*' 'garde-fou-*' 2>/dev/null | sed 's/^/  /'
+    for s in /sys/fs/cgroup/batch.slice/*.scope; do [ -d "$s" ] || continue
+      echo "  $(basename "$s") :"; for p in $(cat "$s/cgroup.procs"); do echo "    $(ps -o pid=,user=,stat=,etime=,args= -p "$p" | cut -c1-150)"; done; done
+    exit 0 ;;
+  --adopter)
+    shift; [ $# -ge 1 ] || usage 2
+    if [ "$(id -u)" = 0 ]; then exec "$ADOPTER" --sous-arbre "$@"; else exec sudo -n "$ADOPTER" --sous-arbre "$@"; fi ;;
+esac
+NOM=""
+if [ "${1:-}" = --nom ]; then NOM=${2:-}; shift 2 || usage 2; fi
+[ $# -ge 1 ] || usage 2
+NOM=${NOM:-$(basename "$1")}
+if [ "$(id -u)" = 0 ]; then "$ADOPTER" --nom "$NOM" $$ >/dev/null
+else sudo -n "$ADOPTER" --nom "$NOM" $$ >/dev/null; fi || {
+  echo "lourd: impossible de ranger le job dans batch.slice — RIEN n'a ete lance." >&2; exit 1; }
+exec nice -n 10 "$@"

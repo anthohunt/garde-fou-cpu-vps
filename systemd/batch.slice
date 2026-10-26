@@ -1,0 +1,15 @@
+# garde-fou CPU — slice des travaux de fond NON prioritaires.
+# Compressions d'images, builds, conversions, gros calculs ponctuels : tout ce
+# qui peut attendre. Plafond dur : CPUQuota=50% = une demi-coeur = 25 % du VPS
+# (2 coeurs). But : qu'Hostinger ne plafonne plus jamais le VPS (un jour : ~5 h a
+# 60-90 % -> ct_set_limits a 20 %).
+# Lancer un job : lourd <commande...>        (voir lourd --help)
+# Ranger un job deja lance : lourd --adopter <PID...>   (root)
+[Unit]
+Description=Travaux lourds non prioritaires (plafond CPU garde-fou)
+Before=slices.target
+
+[Slice]
+CPUQuota=50%
+CPUWeight=20
+IOWeight=20

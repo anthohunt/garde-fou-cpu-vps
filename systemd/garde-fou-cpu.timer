@@ -1,0 +1,11 @@
+[Unit]
+Description=Garde-fou CPU : un passage par minute
+
+[Timer]
+OnBootSec=2min
+OnCalendar=*-*-* *:*:00
+AccuracySec=5s
+Persistent=false
+
+[Install]
+WantedBy=timers.target

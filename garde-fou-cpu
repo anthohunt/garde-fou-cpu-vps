@@ -1,0 +1,851 @@
+#!/usr/bin/env python3
+"""garde-fou-cpu — empeche l'hebergeur de plafonner un petit VPS (teste sur 2 coeurs, Hostinger).
+
+Pourquoi : ~5 h a 60-90 % de CPU (compression d'images) ont declenche
+une action Hostinger « ct_set_limits » : CPU plafonne a 20 % (steal ~80 %).
+
+Ce que fait `tick` (timer systemd, chaque minute, en root) :
+  1. mesure l'usage CPU reel du VPS (hors steal) en % des 2 coeurs, moyennes
+     5/10/30/60 min, et le steal ;
+  2. au-dessus du seuil d'ALERTE (et si la charge est toujours la) : range les
+     processus gourmands NON proteges dans batch.slice (plafond 25 % du VPS) ;
+     si ca ne suffit pas, les met en pause (SIGSTOP) — tout est journalise et
+     reversible (`garde-fou-cpu reprendre ID`, `garde-fou-cpu liberer ID`) ;
+  3. seuil CRITIQUE : idem tout de suite + notification ntfy (silencieuse la nuit) ;
+  4. toutes les 15 min interroge l'API Hostinger (actions + metriques) ;
+     PLAFONNEMENT AVERE (steal local soutenu + plateau API / nouvelle action
+     ct_set_limits) -> alarme sur le telephone du proprietaire (une par episode) + mail,
+     si les commandes d'alarme et d'alerte sont configurees.
+  5. reprend tout seul ses propres pauses quand la charge est redescendue.
+
+Commandes :
+  garde-fou-cpu statut                      moyennes, niveau, actions en cours
+  garde-fou-cpu reprendre ID|tout           SIGCONT des pauses (ID = statut)
+  garde-fou-cpu liberer ID|tout             sort de batch.slice / retire le quota
+  garde-fou-cpu api                         interroge Hostinger maintenant
+  garde-fou-cpu tick [--dry-run] [--seuils-test] [--cible-test REGEX]
+"""
+import argparse, datetime, fcntl, json, os, re, signal, subprocess, sys, time
+import urllib.parse, urllib.request
+
+CONF = '/etc/garde-fou-cpu/config.json'
+VAR = '/var/lib/garde-fou-cpu'
+ETAT = f'{VAR}/etat.json'          # lisible par tous (statut)
+INTERNE = f'{VAR}/interne.json'    # echantillons, EMA, registre
+VERROU = f'{VAR}/verrou'
+LOG = '/var/log/garde-fou-cpu.log'
+ADOPTER = '/usr/local/sbin/lourd-adopter'
+API_BASE = 'https://developers.hostinger.com/api/vps/v1/virtual-machines/'
+# Chemins et identifiants : section "reglages" de config.json (voir config/config.example.json).
+# Valeurs par defaut = rien d'actif : sans reglage, le garde-fou ne fait que mesurer et ranger.
+REGLAGES = {'journal': '', 'jeton_hostinger': '/etc/garde-fou-cpu/hostinger-token',
+            'vm_id': '', 'ntfy_env': '/etc/garde-fou-cpu/ntfy.env',
+            'commande_alarme': '', 'utilisateur_alarme': '', 'commande_alerte': ''}
+JOURNAL = JETON = NTFY_ENV = NTFY_ALARM = USER_ALARME = FLUX_ALERTE = API = ''  # remplis par appliquer_reglages
+HZ = os.sysconf('SC_CLK_TCK')
+SHELLS = {'bash', 'sh', 'dash', 'zsh', 'fish'}
+PARENTS_BARRIERE = {'tmux: server', 'tmux', 'sshd', 'systemd', 'sudo', 'su', 'login', 'bwrap',
+                    'screen', 'runuser', 'cron', 'init', 'agetty', '(sd-pam)', 'mosh-server'}
+
+DEFAUT = {
+    "seuils": {  # % des 2 coeurs du VPS (comme le cpu_usage Hostinger), hors steal
+        "alerte_30": 50, "alerte_60": 45,
+        "critique_30": 65, "critique_60": 60,
+        "charge_actuelle_5": 40,          # on n'agit que si la charge est TOUJOURS la
+        "reprise_30": 35, "reprise_10": 30,
+        "candidat_pct_coeur": 15,         # un processus compte s'il prend >= 15 % d'un coeur
+        "max_actions_par_tick": 3,
+        "attente_avant_pause_min": 10,
+        "pause_min_avant_reprise_min": 30,
+        "vol_15": 25, "vol_30": 20, "vol_30_plateau": 10,
+        "plateau_ecart": 0.3, "plateau_min": 10, "plateau_max": 50, "plateau_points": 3,
+        "api_toutes_les_min": 15, "api_hors_service_min": 45,
+        "notif_critique_toutes_les_min": 120, "sans_candidat_toutes_les_min": 60,
+        "fin_episode_min": 60, "couverture_min": 0.8,
+        "quota_service": "50%"
+    },
+    "fenetres_min": {"court": 5, "dix": 10, "moyen": 30, "long": 60},
+    "reglages": REGLAGES,
+    "fuseau": "Europe/Paris",
+    "nuit": ["22:00", "07:30"],
+    "proteges": {
+        "utilisateurs": [],
+        "comm": ["claude", "codex", "codex-code-mode", "codex-code-mode-host", "sshd", "ssh", "scp",
+                 "tailscaled", "tailscale", "systemd", "systemd-journal", "systemd-logind",
+                 "systemd-udevd", "systemd-network", "systemd-resolve", "systemd-timesyn",
+                 "dbus-daemon", "containerd", "dockerd", "traefik", "ollama", "tmux: server",
+                 "sudo", "garde-fou-cpu", "lourd-adopter", "monarx-agent", "warp-svc",
+                 "cron", "rsyslogd", "agetty", "polkitd", "unattended-upgr", "multipathd"],
+        "node_si_cmdline": "@anthropic-ai|claude-code|@openai/codex|/bin/(claude|codex)\\b",
+        "cmdline_regex": [],
+        # tout le sous-arbre (descendants) de ces processus est protege
+        "sous_arbre_regex": [],
+        "sous_arbre_utilisateurs": [],
+        "unites": ["tailscaled.service", "ssh.service", "garde-fou-cpu.service"],
+        "ports": [22]
+    }
+}
+TEST = {  # --seuils-test : seuils et fenetres minuscules pour verifier la chaine
+    "seuils": {"alerte_30": 0.5, "alerte_60": 0.5, "critique_30": 1000, "critique_60": 1000,
+               "charge_actuelle_5": 0.5, "attente_avant_pause_min": 0.5, "couverture_min": 0.0,
+               "reprise_30": -1, "reprise_10": -1},
+    "fenetres_min": {"court": 1, "dix": 1, "moyen": 2, "long": 3}
+}
+
+
+def maintenant():
+    return time.time()
+
+
+def iso(t=None):
+    return datetime.datetime.fromtimestamp(t or maintenant(), datetime.timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
+
+
+def fusion(a, b):
+    out = json.loads(json.dumps(a))
+    for k, v in b.items():
+        out[k] = fusion(out[k], v) if isinstance(v, dict) and isinstance(out.get(k), dict) else v
+    return out
+
+
+def appliquer_reglages(c):
+    global JOURNAL, JETON, NTFY_ENV, NTFY_ALARM, USER_ALARME, FLUX_ALERTE, API
+    r = c['reglages']
+    JOURNAL, JETON, NTFY_ENV = r['journal'], r['jeton_hostinger'], r['ntfy_env']
+    NTFY_ALARM, USER_ALARME, FLUX_ALERTE = r['commande_alarme'], r['utilisateur_alarme'], r['commande_alerte']
+    API = API_BASE + str(r['vm_id']) if r['vm_id'] else ''
+
+
+def charger_conf(test=False):
+    c = DEFAUT
+    try:
+        with open(CONF) as f:
+            c = fusion(c, json.load(f))
+    except FileNotFoundError:
+        pass
+    c = fusion(c, TEST) if test else c
+    appliquer_reglages(c)
+    return c
+
+
+DRY = False
+
+
+def log(msg, journal=False):
+    ligne = f'{iso()} {"[dry-run] " if DRY else ""}{msg}'
+    print(ligne)
+    try:
+        with open(LOG, 'a') as f:
+            f.write(ligne + '\n')
+    except OSError:
+        pass
+    if journal and JOURNAL and not DRY:
+        try:
+            with open(JOURNAL, 'a') as f:
+                f.write(f'- {iso()[:16]}Z [garde-fou CPU] {msg}\n')
+        except OSError:
+            pass
+
+
+def ecrire_json(chemin, obj, mode=0o600):
+    tmp = chemin + '.tmp'
+    with open(tmp, 'w') as f:
+        json.dump(obj, f, ensure_ascii=False, indent=1)
+    os.chmod(tmp, mode)
+    os.replace(tmp, chemin)
+
+
+def lire_json(chemin, defaut):
+    try:
+        with open(chemin) as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return defaut
+
+
+# ---------------------------------------------------------------- mesures CPU
+def lire_stat():
+    with open('/proc/stat') as f:
+        v = [int(x) for x in f.readline().split()[1:9]]
+    user, nice, system, idle, iowait, irq, softirq, steal = v
+    busy = user + nice + system + irq + softirq
+    return busy, steal, busy + idle + iowait + steal
+
+
+def boot_id():
+    with open('/proc/sys/kernel/random/boot_id') as f:
+        return f.read().strip()
+
+
+def moyennes(ech, fen_min, couverture_min):
+    """% du VPS (busy, steal) sur la fenetre ; None si historique insuffisant."""
+    if len(ech) < 2:
+        return None, None
+    t1, b1, s1, tot1 = ech[-1]
+    debut = t1 - fen_min * 60
+    base = next((e for e in ech if e[0] >= debut - 20), None)
+    if base is None or base is ech[-1]:
+        return None, None
+    if (t1 - base[0]) < couverture_min * fen_min * 60:
+        return None, None
+    dt = tot1 - base[3]
+    if dt <= 0:
+        return None, None
+    return round(100 * (b1 - base[1]) / dt, 1), round(100 * (s1 - base[2]) / dt, 1)
+
+
+# ------------------------------------------------------------- processus
+class P:
+    __slots__ = ('pid', 'ppid', 'comm', 'etat', 'ticks', 'enf', 'debut', 'uid', 'user', 'cmd', 'cg')
+
+
+_users = {}
+
+
+def nom_user(uid):
+    if uid not in _users:
+        try:
+            import pwd
+            _users[uid] = pwd.getpwuid(uid).pw_name
+        except KeyError:
+            _users[uid] = str(uid)
+    return _users[uid]
+
+
+def lire_procs():
+    procs = {}
+    for d in os.listdir('/proc'):
+        if not d.isdigit():
+            continue
+        pid = int(d)
+        try:
+            with open(f'/proc/{d}/stat') as f:
+                s = f.read()
+            i = s.rindex(')')
+            x = s[i + 2:].split()
+            p = P()
+            p.pid, p.comm, p.etat, p.ppid = pid, s[s.index('(') + 1:i], x[0], int(x[1])
+            p.ticks = int(x[11]) + int(x[12])          # temps CPU propre
+            p.enf = int(x[13]) + int(x[14])            # temps des enfants deja termines (recoltes)
+            p.debut = int(x[19])
+            with open(f'/proc/{d}/cmdline', 'rb') as f:
+                p.cmd = f.read().replace(b'\0', b' ').decode('utf-8', 'replace').strip()
+            with open(f'/proc/{d}/status') as f:
+                p.uid = next(int(l.split()[1]) for l in f if l.startswith('Uid:'))
+            p.user = nom_user(p.uid)
+            with open(f'/proc/{d}/cgroup') as f:
+                p.cg = f.read().strip().split('::', 1)[-1]
+            procs[pid] = p
+        except (OSError, ValueError, StopIteration, IndexError):
+            continue
+    return procs
+
+
+def pids_ports(ports):
+    out = set()
+    try:
+        r = subprocess.run(['ss', '-ltnupH'], capture_output=True, text=True, timeout=10).stdout
+    except Exception:
+        return out
+    for l in r.splitlines():
+        c = l.split()
+        if len(c) < 5:
+            continue
+        try:
+            port = int(c[4].rsplit(':', 1)[1])
+        except (ValueError, IndexError):
+            continue
+        if port in ports:
+            out.update(int(m) for m in re.findall(r'pid=(\d+)', l))
+    return out
+
+
+class Protection:
+    def __init__(self, conf, procs):
+        pr = conf['proteges']
+        self.procs = procs
+        self.users = set(pr['utilisateurs'])
+        self.comm = set(pr['comm'])
+        self.node = re.compile(pr['node_si_cmdline'])
+        self.cmd = [re.compile(r) for r in pr['cmdline_regex']]
+        self.sa = [re.compile(r) for r in pr['sous_arbre_regex']]
+        self.sa_users = set(pr['sous_arbre_utilisateurs'])
+        self.unites = set(pr['unites'])
+        self.ports = pids_ports(set(pr['ports']))
+        self.moi = {os.getpid(), os.getppid()}
+        self._memo = {}
+
+    def direct(self, p):
+        if p.pid <= 2 or p.ppid == 2 or not p.cmd or p.pid in self.moi:
+            return 'noyau/systeme'
+        if p.user in self.users:
+            return f'utilisateur {p.user}'
+        if p.comm in self.comm:
+            return f'commande {p.comm}'
+        if p.comm in ('node', 'MainThread') and self.node.search(p.cmd):
+            return 'node Claude/Codex'
+        for r in self.cmd:
+            if r.search(p.cmd):
+                return f'motif {r.pattern}'
+        unite = p.cg.rstrip('/').rsplit('/', 1)[-1]
+        if unite in self.unites:
+            return f'unite {unite}'
+        if p.pid in self.ports:
+            return 'port protege'
+        return None
+
+    def racine_protegee(self, p):
+        return p.user in self.sa_users or any(r.search(p.cmd) for r in self.sa)
+
+    def raison(self, pid):
+        """None si le processus peut etre bride/pause, sinon la raison."""
+        if pid in self._memo:
+            return self._memo[pid]
+        p = self.procs.get(pid)
+        if p is None:
+            return 'disparu'
+        r = self.direct(p)
+        if r is None:
+            q, vus = self.procs.get(p.ppid), set()
+            while q is not None and q.pid > 1 and q.pid not in vus:
+                vus.add(q.pid)
+                if self.racine_protegee(q):
+                    r = f'descendant de {q.pid} ({q.comm})'
+                    break
+                q = self.procs.get(q.ppid)
+        self._memo[pid] = r
+        return r
+
+
+def racine_job(pid, procs, prot):
+    cur = pid
+    while True:
+        pp = procs[cur].ppid
+        par = procs.get(pp)
+        if pp <= 1 or par is None or prot.raison(pp) or par.comm in PARENTS_BARRIERE \
+                or par.comm.startswith('containerd-shim'):
+            return cur
+        cur = pp
+
+
+def sous_arbre(racine, procs, prot):
+    enf = {}
+    for p in procs.values():
+        enf.setdefault(p.ppid, []).append(p.pid)
+    out, file = [], [racine]
+    while file:
+        x = file.pop()
+        if prot.raison(x):
+            continue
+        out.append(x)
+        file.extend(enf.get(x, []))
+    return out
+
+
+def chaine_pause(pid, racine, procs, prot):
+    """le processus gourmand + ses ancetres non-shell jusqu'a la racine du job."""
+    out, cur = [pid], pid
+    while cur != racine:
+        cur = procs[cur].ppid
+        if cur not in procs or prot.raison(cur):
+            break
+        if procs[cur].comm not in SHELLS:
+            out.append(cur)
+    return out
+
+
+# --------------------------------------------------------------- notifications
+def ntfy_env():
+    env = {}
+    with open(NTFY_ENV) as f:
+        for l in f:
+            if '=' in l and not l.lstrip().startswith('#'):
+                k, v = l.strip().split('=', 1)
+                env[k] = v.strip().strip('"').strip("'")
+    return env
+
+
+def est_nuit(conf):
+    try:
+        from zoneinfo import ZoneInfo
+        h = datetime.datetime.now(ZoneInfo(conf.get('fuseau', 'UTC'))).strftime('%H:%M')
+    except Exception:
+        h = time.strftime('%H:%M')
+    a, b = conf['nuit']
+    return h >= a or h < b
+
+
+def notifier(conf, titre, msg):
+    """notification simple (pas une alarme) ; silencieuse la nuit."""
+    prio = '2' if est_nuit(conf) else '3'
+    if DRY:
+        log(f'notification ntfy (priorite {prio}) : {titre} — {msg}')
+        return True
+    try:
+        e = ntfy_env()
+        req = urllib.request.Request(f"{e['NTFY_URL']}/{e['NTFY_TOPIC']}", data=msg.encode(), method='POST',
+                                     headers={'Authorization': f"Bearer {e['NTFY_TOKEN']}", 'Title': titre,
+                                              'Priority': prio, 'Tags': 'warning'})
+        urllib.request.urlopen(req, timeout=15).read()
+        log(f'notification ntfy envoyee (priorite {prio}) : {titre}', journal=True)
+        return True
+    except Exception as ex:
+        log(f'ECHEC notification ntfy : {type(ex).__name__}', journal=True)
+        return False
+
+
+def alarme(titre, msg):
+    """alarme qui sonne en boucle (skill alarm / ntfy-alarm) + mail. Plafonnement avere seulement."""
+    if DRY:
+        log(f'ALARME telephone (ntfy-alarm now) : {titre} — {msg}')
+        return True
+    ok = False
+    try:
+        if not NTFY_ALARM:
+            raise RuntimeError('commande_alarme non configuree')
+        cmd = [NTFY_ALARM, 'now', titre, msg]
+        if USER_ALARME:
+            cmd = ['runuser', '-u', USER_ALARME, '--'] + cmd
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
+        ok = r.returncode == 0
+        log(f'alarme telephone {"posee" if ok else "ECHEC"} : {titre} {r.stdout.strip()[:120]}', journal=True)
+    except Exception as ex:
+        log(f'ECHEC alarme telephone : {type(ex).__name__}', journal=True)
+    try:
+        if not FLUX_ALERTE:
+            return ok
+        subprocess.run([FLUX_ALERTE, '--sujet', f'[VPS] {titre}', '--corps', msg],
+                       capture_output=True, timeout=60)
+    except Exception:
+        pass
+    return ok
+
+
+# ----------------------------------------------------------------- API Hostinger
+def api_get(chemin):
+    if not API:
+        raise RuntimeError('vm_id non configure : API de l\'hebergeur desactivee')
+    with open(JETON) as f:
+        jeton = f.read().strip()
+    req = urllib.request.Request(API + chemin, headers={'Authorization': f'Bearer {jeton}',
+                                                       'Accept': 'application/json',
+                                                       'User-Agent': 'curl/8.5.0 garde-fou-cpu'})
+    with urllib.request.urlopen(req, timeout=20) as r:
+        return json.load(r)
+
+
+def verifier_api(st, conf, force=False):
+    s = conf['seuils']
+    a = st.setdefault('api', {})
+    t = maintenant()
+    if not force and t - a.get('derniere_tentative', 0) < s['api_toutes_les_min'] * 60:
+        return a
+    a['derniere_tentative'] = t
+    if not API:   # pas de vm_id configure : API de l'hebergeur volontairement desactivee
+        return a
+    try:
+        acts = api_get('/actions').get('data', [])
+        dfrom = datetime.datetime.fromtimestamp(t - 3 * 3600, datetime.timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
+        met = api_get('/metrics?' + urllib.parse.urlencode({'date_from': dfrom, 'date_to': iso(t)}))
+    except Exception as ex:
+        a['ok'] = False
+        a['erreur'] = f'{type(ex).__name__}: {str(ex)[:80]}'
+        log(f'API Hostinger injoignable : {a["erreur"]}')
+        return a
+    a['ok'], a['dernier_ok'], a['erreur'] = True, t, None
+    ids = [x['id'] for x in acts]
+    vu = a.get('dernier_id_vu')
+    if vu is None:
+        a['dernier_id_vu'] = max(ids) if ids else 0
+    else:
+        for x in sorted(acts, key=lambda x: x['id']):
+            if x['id'] > vu:
+                log(f"API Hostinger : nouvelle action {x['name']} ({x['state']}) a {x['created_at']}", journal=True)
+                if x['name'] == 'ct_set_limits':
+                    a['dernier_ct_set_limits'] = x['created_at']
+                    a['dernier_ct_set_limits_vu_a'] = t
+        a['dernier_id_vu'] = max(ids + [vu])
+    pts = sorted((int(k), float(v)) for k, v in met.get('cpu_usage', {}).get('usage', {}).items())
+    a['points'] = [[iso(k)[11:16], v] for k, v in pts[-6:]]
+    n = s['plateau_points']
+    der = [v for _, v in pts[-n:]]
+    a['plateau'] = bool(len(der) == n and max(der) - min(der) <= s['plateau_ecart']
+                        and s['plateau_min'] <= sum(der) / n <= s['plateau_max'])
+    if a['plateau']:
+        log(f'API Hostinger : PLATEAU detecte sur les {n} derniers points {der}', journal=True)
+    return a
+
+
+# ------------------------------------------------------------------- actions
+def nouvel_id(st):
+    st['seq'] = st.get('seq', 0) + 1
+    return f"G{st['seq']}"
+
+
+def adopter(pids, nom):
+    r = subprocess.run([ADOPTER, '--nom', nom] + [str(p) for p in pids], capture_output=True, text=True)
+    if r.returncode != 0:
+        raise RuntimeError(r.stderr.strip() or r.stdout.strip())
+    return r.stdout.strip()
+
+
+def confiner(st, conf, p, procs, prot, pourquoi):
+    """range le job dans batch.slice (session/utilisateur) ou pose un quota (service systeme)."""
+    if p.cg.startswith('/batch.slice'):
+        return None
+    if p.cg.startswith('/system.slice/'):
+        unite = p.cg.split('/')[2]
+        if any(a['type'] == 'quota' and a['unite'] == unite and a['etat'] == 'actif' for a in st['actions']):
+            return None
+        q = conf['seuils']['quota_service']
+        act = {'id': nouvel_id(st), 'type': 'quota', 'unite': unite, 'quota': q, 'pids': [p.pid],
+               'commande': p.cmd[:160], 'utilisateur': p.user, 'quand': iso(), 't': maintenant(),
+               'pourquoi': pourquoi, 'etat': 'actif',
+               'annuler': f'garde-fou-cpu liberer {{id}}  (= systemctl set-property --runtime {unite} CPUQuota=)'}
+        if not DRY:
+            subprocess.run(['systemctl', 'set-property', '--runtime', unite, f'CPUQuota={q}'], check=True)
+    else:
+        racine = racine_job(p.pid, procs, prot)
+        pids = sous_arbre(racine, procs, prot)
+        act = {'id': nouvel_id(st), 'type': 'confinement', 'pids': pids, 'racine': racine,
+               'debuts': {str(x): procs[x].debut for x in pids},
+               'cgroup_origine': {str(x): procs[x].cg for x in pids},
+               'gourmand': p.pid, 'commande': p.cmd[:160], 'commande_racine': procs[racine].cmd[:160],
+               'utilisateur': p.user, 'quand': iso(), 't': maintenant(), 'pourquoi': pourquoi,
+               'etat': 'actif', 'annuler': 'garde-fou-cpu liberer {id}  (remet les processus dans leur cgroup d origine)'}
+        if not DRY:
+            act['scope'] = adopter(pids, f'garde-fou-{p.comm}')
+    act['annuler'] = act['annuler'].format(id=act['id'])
+    detail = f"service {act['unite']} quota {act['quota']}" if act['type'] == 'quota' \
+        else f"{len(act['pids'])} processus (racine {act['racine']}) -> batch.slice"
+    log(f"{act['id']} CONFINEMENT {detail} ; gourmand {p.pid} {p.user} « {p.cmd[:90]} » ; "
+        f"pourquoi : {pourquoi} ; annuler : {act['annuler']}", journal=True)
+    if DRY:
+        st['seq'] -= 1
+        return act
+    st['actions'].append(act)
+    return act
+
+
+def mettre_en_pause(st, p, procs, prot, pourquoi):
+    racine = racine_job(p.pid, procs, prot)
+    pids = chaine_pause(p.pid, racine, procs, prot)
+    act = {'id': nouvel_id(st), 'type': 'pause', 'pids': pids,
+           'debuts': {str(x): procs[x].debut for x in pids}, 'gourmand': p.pid,
+           'commande': p.cmd[:160], 'utilisateur': p.user, 'quand': iso(), 't': maintenant(),
+           'pourquoi': pourquoi, 'etat': 'actif'}
+    act['annuler'] = f"garde-fou-cpu reprendre {act['id']}  (= kill -CONT {' '.join(map(str, pids))})"
+    if not DRY:
+        for x in pids:
+            try:
+                os.kill(x, signal.SIGSTOP)
+            except ProcessLookupError:
+                pass
+    log(f"{act['id']} PAUSE (SIGSTOP) {pids} ; gourmand {p.pid} {p.user} « {p.cmd[:90]} » ; "
+        f"pourquoi : {pourquoi} ; reprendre : {act['annuler']}", journal=True)
+    if DRY:
+        st['seq'] -= 1
+        return act
+    st['actions'].append(act)
+    return act
+
+
+def vivant(pid, debut):
+    try:
+        with open(f'/proc/{pid}/stat') as f:
+            s = f.read()
+        return int(s[s.rindex(')') + 2:].split()[19]) == int(debut)
+    except (OSError, ValueError, IndexError):
+        return False
+
+
+def reprendre(act, qui):
+    n = 0
+    for x in act['pids']:
+        if vivant(x, act['debuts'][str(x)]):
+            if not DRY:
+                os.kill(x, signal.SIGCONT)
+            n += 1
+    if not DRY:
+        act['etat'], act['repris'], act['repris_par'] = 'repris', iso(), qui
+    log(f"{act['id']} REPRISE (SIGCONT) de {n} processus {act['pids']} par {qui}", journal=True)
+
+
+def liberer(act, qui):
+    if act['type'] == 'quota':
+        if not DRY:
+            subprocess.run(['systemctl', 'set-property', '--runtime', act['unite'], 'CPUQuota='], check=False)
+        msg = f"quota retire sur {act['unite']}"
+    else:
+        n = 0
+        for x in act['pids']:
+            orig = act['cgroup_origine'].get(str(x))
+            dest = f'/sys/fs/cgroup{orig}/cgroup.procs'
+            if orig and vivant(x, act['debuts'][str(x)]) and os.path.exists(dest):
+                if not DRY:
+                    try:
+                        with open(dest, 'w') as f:
+                            f.write(str(x))
+                        n += 1
+                    except OSError:
+                        pass
+        msg = f'{n} processus remis dans leur cgroup d origine'
+    if not DRY:
+        act['etat'], act['libere'], act['libere_par'] = 'libere', iso(), qui
+    log(f"{act['id']} LIBERATION : {msg} (par {qui})", journal=True)
+
+
+def menage_actions(st):
+    """une action dont tous les processus ont disparu est close."""
+    for a in st['actions']:
+        if a['etat'] == 'actif' and a['type'] != 'quota':
+            if not any(vivant(x, a['debuts'][str(x)]) for x in a['pids']):
+                a['etat'] = 'termine'
+                a['termine'] = iso()
+    st['actions'] = [a for a in st['actions'] if a['etat'] == 'actif'
+                     or maintenant() - a.get('t', 0) < 7 * 86400][-200:]
+
+
+# ---------------------------------------------------------------------- tick
+def tick(args):
+    conf = charger_conf(args.seuils_test)
+    s, fen = conf['seuils'], conf['fenetres_min']
+    st = lire_json(INTERNE, {})
+    st.setdefault('actions', [])
+    t = maintenant()
+    b = boot_id()
+    if st.get('boot') != b:
+        st['boot'], st['echantillons'], st['procs'] = b, [], {}
+    busy, steal, tot = lire_stat()
+    ech = st['echantillons']
+    ech.append([t, busy, steal, tot])
+    st['echantillons'] = ech = [e for e in ech if e[0] >= t - (max(fen.values()) + 15) * 60]
+    cov = s['couverture_min']
+    m = {k: moyennes(ech, v, cov) for k, v in fen.items()}
+    a5, a10, a30, a60 = (m[k][0] for k in ('court', 'dix', 'moyen', 'long'))
+    v15 = moyennes(ech, 15, cov)[1] if not args.seuils_test else m['moyen'][1]
+    v30, v60 = m['moyen'][1], m['long'][1]
+
+    # charge par processus (EMA, % d'un coeur)
+    procs = lire_procs()
+    prot = Protection(conf, procs)
+    anc = st.get('procs', {})
+    dt_prec = t - st.get('t_prec', t - 60)
+    with open('/proc/uptime') as f:
+        up = float(f.read().split()[0])
+    # Le temps des enfants termines (cutime) n'est compte que si le processus
+    # n'orchestre pas de processus proteges : sinon un lanceur de sessions codex
+    # (mission-loop...) heriterait du CPU de ses codex a leur sortie.
+    orch = {p.ppid for p in procs.values() if prot.raison(p.pid) and p.ppid > 1}
+    nouv = {}
+    for p in procs.values():
+        k = str(p.pid)
+        o = p.pid in orch or (k in anc and len(anc[k]) > 4 and anc[k][4])
+        if k in anc and len(anc[k]) > 4 and anc[k][0] == p.debut and dt_prec > 5:
+            d = (p.ticks - anc[k][1]) + (0 if o else max(p.enf - anc[k][2], 0))
+            ema = 0.5 * anc[k][3] + 0.5 * 100 * d / HZ / dt_prec
+        else:
+            ema = 100 * p.ticks / HZ / max(up - p.debut / HZ, 1)   # 1re vue : moyenne de vie (temps propre)
+        nouv[k] = [p.debut, p.ticks, p.enf, round(max(ema, 0), 1), p.pid in orch]
+    st['procs'] = nouv
+    st['t_prec'] = t
+    charge = {int(k): v[3] for k, v in nouv.items()}
+
+    menage_actions(st)
+    api = verifier_api(st, conf) if not args.cible_test else st.get('api', {})
+
+    alerte = (a30 is not None and a30 >= s['alerte_30']) or (a60 is not None and a60 >= s['alerte_60'])
+    critique = (a30 is not None and a30 >= s['critique_30']) or (a60 is not None and a60 >= s['critique_60'])
+    local = v15 is not None and v15 >= s['vol_15'] and (v30 or 0) >= s['vol_30']
+    ct_recent = t - api.get('dernier_ct_set_limits_vu_a', 0) < 86400
+    api_hs = t - api.get('dernier_ok', t) > s['api_hors_service_min'] * 60
+    plafonne = (local and (api.get('plateau') or ct_recent or api_hs)) or \
+               (bool(api.get('plateau')) and (v30 or 0) >= s['vol_30_plateau'])
+    actif = a5 is not None and a5 >= s['charge_actuelle_5']
+    niveau = 'PLAFONNE' if plafonne else 'CRITIQUE' if critique else 'ALERTE' if alerte else 'normal'
+
+    # candidats : non proteges, gourmands, du plus gros au plus petit
+    cible = re.compile(args.cible_test) if args.cible_test else None
+    cands = []
+    for pid, pct in sorted(charge.items(), key=lambda x: -x[1]):
+        if pct < s['candidat_pct_coeur'] or pid not in procs:
+            continue
+        p = procs[pid]
+        if p.etat == 'T' or prot.raison(pid):
+            continue
+        if cible and not cible.search(p.cmd):
+            continue
+        cands.append(p)
+
+    resume = (f'niveau={niveau} moy5={a5} moy10={a10} moy30={a30} moy60={a60} '
+              f'steal15={v15} steal30={v30} candidats={[(c.pid, c.comm, charge[c.pid]) for c in cands[:5]]}')
+    if args.verbeux or DRY:
+        log('tick ' + resume)
+    elif t - st.get('dernier_resume', 0) >= 900:
+        log('tick ' + resume)
+        st['dernier_resume'] = t
+
+    if (alerte or critique or plafonne) and (actif or plafonne):
+        pourquoi = f'{niveau} (moy30={a30} %, moy60={a60} %, moy5={a5} %, steal15={v15} %)'
+        n = 0
+        for p in cands:
+            if n >= s['max_actions_par_tick']:
+                break
+            conf_act = next((a for a in st['actions'] if a['etat'] == 'actif' and a['type'] in ('confinement', 'quota')
+                             and p.pid in a['pids']), None)
+            deja_bride = p.cg.startswith('/batch.slice') or conf_act is not None
+            if not deja_bride:
+                confiner(st, conf, p, procs, prot, pourquoi)
+                n += 1
+                if critique or plafonne:
+                    mettre_en_pause(st, p, procs, prot, pourquoi + ' — critique : pause immediate')
+                continue
+            age = t - (conf_act['t'] if conf_act else 0)
+            if critique or plafonne or (age >= s['attente_avant_pause_min'] * 60
+                                        and a10 is not None and a10 >= s['alerte_30']):
+                mettre_en_pause(st, p, procs, prot, pourquoi + ' — deja bride, toujours trop haut')
+                n += 1
+        if not cands and not cible and t - st.get('dernier_sans_candidat', 0) >= s['sans_candidat_toutes_les_min'] * 60:
+            top = sorted(((pct, pid) for pid, pct in charge.items() if pid in procs), reverse=True)[:4]
+            qui = ', '.join(f'{procs[pid].comm}/{pid} {pct}% ({prot.raison(pid) or "sous le seuil"})'
+                            for pct, pid in top)
+            log(f'{niveau} sans processus actionnable (tout ce qui consomme est protege) : {qui}', journal=True)
+            if not DRY:
+                st['dernier_sans_candidat'] = t
+
+    if (critique or plafonne) and not cible and \
+            t - st.get('derniere_notif', 0) >= s['notif_critique_toutes_les_min'] * 60:
+        if notifier(conf, f'VPS : CPU {niveau.lower()}',
+                    f'Moyenne CPU {a30} % sur 30 min, {a60} % sur 60 min (seuil critique {s["critique_30"]} %). '
+                    f'Le garde-fou bride/pause les jobs non proteges. Detail : garde-fou-cpu statut') and not DRY:
+            st['derniere_notif'] = t
+
+    ep = st.get('episode')
+    if plafonne and not cible:
+        if not ep:
+            ep = {'debut': iso(), 'alarme': False}
+            log(f'PLAFONNEMENT HOSTINGER AVERE : steal15={v15} % steal30={v30} %, plateau API={api.get("plateau")}, '
+                f'derniere action ct_set_limits={api.get("dernier_ct_set_limits")}', journal=True)
+        if not ep['alarme']:
+            ok = alarme('VPS plafonne par Hostinger',
+                        f'Le VPS est bride (steal {v15} % sur 15 min, plateau API={api.get("plateau")}). '
+                        f'Le garde-fou a deja mis en pause les jobs non proteges. A faire : verifier la cause '
+                        f'(garde-fou-cpu statut), puis lever la limite dans hPanel.')
+            ep['alarme'] = ok or ep['alarme']
+        ep['dernier_vu'] = t
+        if not DRY:
+            st['episode'] = ep
+    elif ep and t - ep.get('dernier_vu', t) >= s['fin_episode_min'] * 60:
+        log(f"fin de l episode de plafonnement commence {ep['debut']}", journal=True)
+        if not DRY:
+            st['episode'] = None
+
+    # reprise automatique des pauses du garde-fou quand la charge est redescendue
+    if not alerte and not plafonne and a30 is not None and a10 is not None \
+            and a30 < s['reprise_30'] and a10 < s['reprise_10']:
+        for a in st['actions']:
+            if a['etat'] == 'actif' and a['type'] == 'pause' and \
+                    t - a['t'] >= s['pause_min_avant_reprise_min'] * 60:
+                reprendre(a, f'garde-fou (auto : moy30={a30} %, moy10={a10} %)')
+                break   # une reprise par minute : pas d'effet yo-yo
+        for a in st['actions']:   # quotas runtime poses sur des services : retires apres 1 h de calme
+            if a['etat'] == 'actif' and a['type'] == 'quota' and t - a['t'] >= 3600:
+                liberer(a, f'garde-fou (auto : moy30={a30} %, moy10={a10} %)')
+
+    etat = {'maj': iso(), 'niveau': niveau, 'moyennes_pct_vps': {'5': a5, '10': a10, '30': a30, '60': a60},
+            'steal_pct': {'15': v15, '30': v30, '60': v60},
+            'seuils': {k: s[k] for k in ('alerte_30', 'alerte_60', 'critique_30', 'critique_60', 'reprise_30')},
+            'api': {k: api.get(k) for k in ('ok', 'erreur', 'plateau', 'points', 'dernier_ct_set_limits')},
+            'api_derniere_reponse': iso(api['dernier_ok']) if api.get('dernier_ok') else None,
+            'episode_plafonnement': st.get('episode'),
+            'candidats': [{'pid': c.pid, 'user': c.user, 'pct_coeur': charge[c.pid], 'cmd': c.cmd[:100]}
+                          for c in cands[:5]],
+            'actions_actives': [a for a in st['actions'] if a['etat'] == 'actif'],
+            'actions_recentes': [a for a in st['actions'] if a['etat'] != 'actif'][-10:]}
+    if not args.seuils_test and not args.cible_test:
+        ecrire_json(ETAT, etat, 0o644)
+    ecrire_json(INTERNE, st)
+    return etat
+
+
+# ------------------------------------------------------------------ commandes
+def statut(_args):
+    e = lire_json(ETAT, None)
+    if not e:
+        sys.exit('pas encore d etat (le timer garde-fou-cpu.timer tourne-t-il ?)')
+    m, v = e['moyennes_pct_vps'], e['steal_pct']
+    print(f"maj {e['maj']} — niveau {e['niveau']}")
+    print(f"CPU du VPS (hors steal, % des 2 coeurs) : 5 min {m['5']} | 10 min {m['10']} | 30 min {m['30']} | 60 min {m['60']}")
+    print(f"steal : 15 min {v['15']} | 30 min {v['30']} | 60 min {v['60']}")
+    print(f"seuils : {e['seuils']}")
+    a = e['api']
+    print(f"API Hostinger : ok={a.get('ok')} plateau={a.get('plateau')} derniers points={a.get('points')} "
+          f"dernier ct_set_limits vu={a.get('dernier_ct_set_limits')}")
+    if e.get('episode_plafonnement'):
+        print(f"EPISODE DE PLAFONNEMENT : {e['episode_plafonnement']}")
+    print('candidats :', ', '.join(f"{c['pid']} {c['user']} {c['pct_coeur']}% {c['cmd'][:50]}" for c in e['candidats']) or 'aucun')
+    print('actions actives :' if e['actions_actives'] else 'actions actives : aucune')
+    for x in e['actions_actives']:
+        print(f"  {x['id']} {x['type']} {x['quand']} pids={x['pids']} « {x['commande'][:70]} »")
+        print(f"     pourquoi : {x['pourquoi']}\n     annuler  : {x['annuler']}")
+    for x in e['actions_recentes'][-5:]:
+        print(f"  (passe) {x['id']} {x['type']} {x['quand']} -> {x['etat']}")
+
+
+def agir(args, fn, types):
+    with open(VERROU, 'w') as v:
+        fcntl.flock(v, fcntl.LOCK_EX)
+        st = lire_json(INTERNE, {'actions': []})
+        qui = os.environ.get('SUDO_USER') or nom_user(os.getuid())
+        ciblees = [a for a in st.get('actions', []) if a['etat'] == 'actif' and a['type'] in types
+                   and (args.id == 'tout' or a['id'] == args.id)]
+        if not ciblees:
+            sys.exit(f'aucune action active {"/".join(types)} avec l id {args.id} (voir garde-fou-cpu statut)')
+        for a in ciblees:
+            fn(a, f'{qui} (manuel)')
+        ecrire_json(INTERNE, st)
+
+
+def main():
+    global DRY
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    sp = ap.add_subparsers(dest='cmd', required=True)
+    t = sp.add_parser('tick')
+    t.add_argument('--dry-run', action='store_true')
+    t.add_argument('--seuils-test', action='store_true')
+    t.add_argument('--cible-test', default=None, help='ne viser que les processus dont la ligne de commande correspond')
+    t.add_argument('-v', '--verbeux', action='store_true')
+    sp.add_parser('statut')
+    sp.add_parser('api')
+    for n in ('reprendre', 'liberer'):
+        x = sp.add_parser(n)
+        x.add_argument('id')
+    a = ap.parse_args()
+    if a.cmd == 'statut':
+        return statut(a)
+    if os.geteuid() != 0:
+        sys.exit('garde-fou-cpu : root requis pour cette commande')
+    os.makedirs(VAR, exist_ok=True)
+    if a.cmd == 'tick':
+        DRY = a.dry_run
+        if a.seuils_test and not a.cible_test and not DRY:
+            sys.exit('--seuils-test exige --cible-test ou --dry-run (sinon il briderait de vrais jobs)')
+        with open(VERROU, 'w') as v:
+            fcntl.flock(v, fcntl.LOCK_EX)
+            tick(a)
+    elif a.cmd == 'api':
+        with open(VERROU, 'w') as v:
+            fcntl.flock(v, fcntl.LOCK_EX)
+            st = lire_json(INTERNE, {'actions': []})
+            r = verifier_api(st, charger_conf(), force=True)
+            ecrire_json(INTERNE, st)
+            print(json.dumps({k: r.get(k) for k in ('ok', 'erreur', 'plateau', 'points', 'dernier_id_vu',
+                                                    'dernier_ct_set_limits')}, ensure_ascii=False, indent=1))
+    elif a.cmd == 'reprendre':
+        agir(a, reprendre, ('pause',))
+    elif a.cmd == 'liberer':
+        agir(a, liberer, ('confinement', 'quota'))
+
+
+if __name__ == '__main__':
+    main()

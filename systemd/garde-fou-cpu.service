@@ -1,0 +1,11 @@
+[Unit]
+Description=Garde-fou CPU : surveille la charge pour qu Hostinger ne plafonne plus le VPS
+Documentation=file:///usr/local/sbin/garde-fou-cpu
+After=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/garde-fou-cpu tick
+Nice=-5
+CPUWeight=500
+TimeoutStartSec=120
